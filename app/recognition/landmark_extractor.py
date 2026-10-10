@@ -1,34 +1,20 @@
+
 """
-SignSpeak AI Service — MediaPipe Landmark Extractor
-====================================================
+SignSpeak - Hand Landmark Extractor
+Extracts 126 hand landmark features (2 hands x 21 landmarks x 3 coordinates)
+using MediaPipe Tasks HandLandmarker.
 
-Wraps MediaPipe HandLandmarker (IMAGE mode) and produces exactly the
-same 126-feature vector that extract_landmarks.py produced during training:
-
-    2 hands × 21 landmarks × (x, y, z)
-    ↓
-    wrist-relative coordinates
-    ↓
-    hands sorted left-to-right by wrist X
-    ↓
-    missing hand stays as zeros
-    ↓
-    flatten → 126 values
-
-CRITICAL: IMAGE mode + detect() is used, matching training exactly.
-VIDEO/LIVE_STREAM mode applies temporal smoothing that training never saw.
+Render deployment: CPU delegate only.
 """
-
-from __future__ import annotations
 
 import logging
-import os
 import time
+from pathlib import Path
 from typing import Optional
 
 import cv2
-import numpy as np
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -36,193 +22,198 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Number of landmarks per hand (MediaPipe hand model)
-_LANDMARKS_PER_HAND = 21
-# XYZ = 3 coordinates
-_COORDS = 3
-
 
 class LandmarkExtractor:
-    """
-    Holds a single shared MediaPipe HandLandmarker instance (IMAGE mode).
+    """Extract normalized hand landmarks from video frames."""
 
-    Usage:
-        extractor = LandmarkExtractor()
-        extractor.load()
-        features = extractor.extract_from_frame(bgr_frame)  # → (126,) or None
-    """
-
-    def __init__(self) -> None:
-        self._landmarker: Optional[vision.HandLandmarker] = None
+    def __init__(self):
+        self.settings = get_settings()
+        self._landmarker = None
         self._loaded = False
-
-    # ------------------------------------------------------------------
-    # Startup
-    # ------------------------------------------------------------------
-
-    def load(self) -> None:
-        """Create the HandLandmarker. Call once at application startup."""
-        settings = get_settings()
-
-        if not os.path.exists(settings.hand_model_path):
-            raise FileNotFoundError(
-                f"[MODEL_NOT_FOUND] MediaPipe hand model not found. "
-                f"Set HAND_MODEL_PATH environment variable. "
-                f"Path checked: {settings.hand_model_path}"
-            )
-
-        logger.info("Loading MediaPipe HandLandmarker…")
-
-        # Try GPU delegate first, fall back to CPU
-        # (mirrors realtime_test.py behaviour for best performance)
-        loaded_with = "CPU"
-        try:
-            gpu_options = vision.HandLandmarkerOptions(
-                base_options=python.BaseOptions(
-                    model_asset_path=settings.hand_model_path,
-                    delegate=python.BaseOptions.Delegate.GPU,
-                ),
-                running_mode=vision.RunningMode.IMAGE,
-                num_hands=settings.num_hands,
-                min_hand_detection_confidence=settings.min_hand_detection_confidence,
-                min_hand_presence_confidence=settings.min_hand_presence_confidence,
-                min_tracking_confidence=settings.min_tracking_confidence,
-            )
-            self._landmarker = vision.HandLandmarker.create_from_options(gpu_options)
-            loaded_with = "GPU"
-            logger.info("MediaPipe HandLandmarker ready (GPU delegate).")
-        except Exception as gpu_err:
-            logger.warning(
-                "GPU delegate unavailable (%s). Falling back to CPU.",
-                repr(gpu_err),
-            )
-            cpu_options = vision.HandLandmarkerOptions(
-                base_options=python.BaseOptions(
-                    model_asset_path=settings.hand_model_path,
-                    delegate=python.BaseOptions.Delegate.CPU,
-                ),
-                running_mode=vision.RunningMode.IMAGE,
-                num_hands=settings.num_hands,
-                min_hand_detection_confidence=settings.min_hand_detection_confidence,
-                min_hand_presence_confidence=settings.min_hand_presence_confidence,
-                min_tracking_confidence=settings.min_tracking_confidence,
-            )
-            self._landmarker = vision.HandLandmarker.create_from_options(cpu_options)
-            logger.info("MediaPipe HandLandmarker ready (CPU delegate).")
-
-        self._loaded = True
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _resize_preserving_aspect(self, frame: np.ndarray, target_width: int) -> np.ndarray:
-        """
-        Scale frame so that width == target_width, preserving aspect ratio.
-        Matches extract_landmarks.py — only applied when frame is wider than target.
-        """
-        h, w = frame.shape[:2]
-        if w <= target_width:
-            return frame
-        new_h = int(h * target_width / w)
-        return cv2.resize(frame, (target_width, new_h), interpolation=cv2.INTER_AREA)
-
-    def _build_feature(self, result) -> tuple[np.ndarray, int]:
-        """
-        Convert MediaPipe result → (126,) feature vector and hand count.
-
-        Feature layout (matches training):
-            slot 0 = hand with smaller wrist.x  (left-most in image)
-            slot 1 = hand with larger  wrist.x  (right-most in image)
-            each slot = 21 landmarks × (x - wrist.x, y - wrist.y, z - wrist.z)
-        """
-        settings = get_settings()
-        num_hands = settings.num_hands
-
-        # Shape: (num_hands, 21, 3) — zero = no hand
-        feature_arr = np.zeros((num_hands, _LANDMARKS_PER_HAND, _COORDS), dtype=np.float32)
-
-        hands = result.hand_landmarks
-        hands_detected = 0
-
-        if hands:
-            # Sort by wrist X to get stable left-to-right order
-            sorted_hands = sorted(hands, key=lambda h: h[0].x)
-            hands_detected = len(sorted_hands)
-
-            for hand_id, hand in enumerate(sorted_hands[:num_hands]):
-                wrist = hand[0]
-                for j, lm in enumerate(hand):
-                    feature_arr[hand_id, j, 0] = lm.x - wrist.x
-                    feature_arr[hand_id, j, 1] = lm.y - wrist.y
-                    feature_arr[hand_id, j, 2] = lm.z - wrist.z
-
-        # Flatten → (126,)
-        return feature_arr.reshape(-1), hands_detected
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     @property
     def is_loaded(self) -> bool:
-        return self._loaded
+        """Return whether the MediaPipe landmarker is initialized."""
+        return self._loaded and self._landmarker is not None
 
-    def extract_from_bgr(self, bgr_frame: np.ndarray) -> tuple[np.ndarray, int]:
-        """
-        Run MediaPipe on a BGR frame and return (features, hands_detected).
+    def load(self) -> None:
+        """Initialize MediaPipe HandLandmarker using the CPU delegate."""
+        if self.is_loaded:
+            logger.info("MediaPipe HandLandmarker already initialized.")
+            return
 
-        features: float32 ndarray of shape (126,)
-        hands_detected: int, 0–2
+        model_path = Path(self.settings.hand_model_path)
 
-        Raises:
-            RuntimeError: if the extractor is not loaded.
-            ValueError: if the frame is invalid.
-        """
-        if not self._loaded or self._landmarker is None:
-            raise RuntimeError("[MEDIAPIPE_ERROR] LandmarkExtractor not loaded.")
+        if not model_path.is_file():
+            raise FileNotFoundError(
+                f"MediaPipe hand model not found: {model_path}"
+            )
 
-        if bgr_frame is None or bgr_frame.size == 0:
-            raise ValueError("[INVALID_IMAGE] Empty or None frame received.")
+        logger.info("Initializing MediaPipe HandLandmarker (CPU)...")
+        start_time = time.time()
 
-        settings = get_settings()
-
-        # 1. Resize preserving aspect ratio (matches training)
-        frame = self._resize_preserving_aspect(bgr_frame, settings.inference_width)
-
-        # 2. BGR → RGB (MediaPipe expects RGB)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # 3. Create MediaPipe Image
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-        # 4. Detect — IMAGE mode, single call (matches training exactly)
         try:
-            result = self._landmarker.detect(mp_image)
-        except Exception as exc:
-            raise RuntimeError(f"[MEDIAPIPE_ERROR] Detection failed: {exc}") from exc
+            base_options = python.BaseOptions(
+                model_asset_path=str(model_path),
+                delegate=python.BaseOptions.Delegate.CPU,
+            )
 
-        # 5. Build 126-feature vector
-        features, hands_detected = self._build_feature(result)
-        return features, hands_detected
+            options = vision.HandLandmarkerOptions(
+                base_options=base_options,
+                running_mode=vision.RunningMode.IMAGE,
+                num_hands=self.settings.num_hands,
+                min_hand_detection_confidence=(
+                    self.settings.min_hand_detection_confidence
+                ),
+                min_hand_presence_confidence=(
+                    self.settings.min_hand_presence_confidence
+                ),
+                min_tracking_confidence=(
+                    self.settings.min_tracking_confidence
+                ),
+            )
 
-    def extract_from_bytes(self, image_bytes: bytes) -> tuple[np.ndarray, int]:
+            self._landmarker = (
+                vision.HandLandmarker.create_from_options(options)
+            )
+            self._loaded = True
+
+            logger.info(
+                "MediaPipe HandLandmarker ready in %.2f seconds.",
+                time.time() - start_time,
+            )
+
+        except Exception:
+            self._landmarker = None
+            self._loaded = False
+            logger.exception(
+                "Failed to initialize MediaPipe HandLandmarker."
+            )
+            raise
+
+    def close(self) -> None:
+        """Release MediaPipe resources."""
+        if self._landmarker is not None:
+            try:
+                self._landmarker.close()
+            except Exception:
+                logger.exception(
+                    "Error while closing MediaPipe HandLandmarker."
+                )
+            finally:
+                self._landmarker = None
+                self._loaded = False
+                logger.info("MediaPipe HandLandmarker closed.")
+
+    def extract(self, frame: np.ndarray) -> np.ndarray:
         """
-        Decode image bytes (JPEG / PNG) then call extract_from_bgr.
+        Extract 126 features from a BGR image frame.
 
-        Raises:
-            ValueError: if decoding fails.
+        Returns:
+            float32 array of shape (126,).
+            Each hand contributes 21 landmarks x (x, y, z).
+            Missing hands are represented by zeros.
         """
-        import numpy as np
-        buf = np.frombuffer(image_bytes, dtype=np.uint8)
-        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        if frame is None:
-            raise ValueError("[INVALID_IMAGE] Could not decode image bytes.")
-        return self.extract_from_bgr(frame)
+        if not self.is_loaded:
+            raise RuntimeError(
+                "LandmarkExtractor is not loaded. Call load() first."
+            )
+
+        if frame is None or not isinstance(frame, np.ndarray):
+            raise ValueError("Input frame must be a valid NumPy image.")
+
+        if frame.size == 0:
+            raise ValueError("Input frame is empty.")
+
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(
+                "Expected a three-channel BGR image with shape (H, W, 3)."
+            )
+
+        height, width = frame.shape[:2]
+        if height <= 0 or width <= 0:
+            raise ValueError("Invalid frame dimensions.")
+
+        # Resize to reduce inference cost while preserving aspect ratio.
+        inference_width = int(self.settings.inference_width)
+
+        if inference_width > 0 and width > inference_width:
+            scale = inference_width / float(width)
+            new_height = max(1, int(round(height * scale)))
+
+            frame = cv2.resize(
+                frame,
+                (inference_width, new_height),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        # MediaPipe expects RGB images.
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame = np.ascontiguousarray(rgb_frame)
+
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=rgb_frame,
+        )
+
+        result = self._landmarker.detect(mp_image)
+
+        # Always return exactly 2 * 21 * 3 = 126 features.
+        features = np.zeros((2, 21, 3), dtype=np.float32)
+
+        if not result.hand_landmarks:
+            return features.reshape(-1)
+
+        detected_hands = []
+
+        for hand_landmarks in result.hand_landmarks:
+            if len(hand_landmarks) != 21:
+                logger.warning(
+                    "Expected 21 landmarks, received %d.",
+                    len(hand_landmarks),
+                )
+                continue
+
+            hand = np.array(
+                [
+                    [landmark.x, landmark.y, landmark.z]
+                    for landmark in hand_landmarks
+                ],
+                dtype=np.float32,
+            )
+
+            # Make coordinates relative to the wrist.
+            # This reduces sensitivity to the hand's position in the frame.
+            hand -= hand[0].copy()
+
+            # Sort hands from left to right for consistent feature ordering.
+            wrist_x = float(hand_landmarks[0].x)
+            detected_hands.append((wrist_x, hand))
+
+        detected_hands.sort(key=lambda item: item[0])
+
+        for index, (_, hand) in enumerate(detected_hands[:2]):
+            features[index] = hand
+
+        return features.reshape(-1)
+
+    def extract_sequence(self, frames: list) -> np.ndarray:
+        """
+        Extract features from a sequence of frames.
+
+        Returns:
+            Array of shape (number_of_frames, 126).
+        """
+        if not frames:
+            return np.empty((0, 126), dtype=np.float32)
+
+        sequence = []
+
+        for frame in frames:
+            sequence.append(self.extract(frame))
+
+        return np.asarray(sequence, dtype=np.float32)
 
 
-# ─────────────────────────────────────────────────────────────
-# Module-level singleton
-# ─────────────────────────────────────────────────────────────
-
+# Shared singleton used by the recognition routes and application lifespan.
 extractor = LandmarkExtractor()
