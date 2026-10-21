@@ -14,9 +14,23 @@ from pydantic import BaseModel, Field
 
 class HealthResponse(BaseModel):
     status: str = "ok"
-    service: str
-    model: str
+    service: str = "signspeak-ai"
+    model: str = "signspeak_combined_best"
     classes: int
+    ready: bool = True
+    predictor_ready: bool = True
+    extractor_ready: bool = True
+
+
+class ReadinessResponse(BaseModel):
+    status: str
+    ready: bool
+    predictor_ready: bool
+    extractor_ready: bool
+
+
+class LivenessResponse(BaseModel):
+    status: str = "alive"
 
 
 # ─────────────────────────────────────────────────────────────

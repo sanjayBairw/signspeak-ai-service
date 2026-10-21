@@ -42,21 +42,35 @@ if str(AI_SERVICE_ROOT) not in sys.path:
     sys.path.insert(0, str(AI_SERVICE_ROOT))
 
 # ─────────────────────────────────────────────────────────────
-# Dataset / model paths (same as .env defaults)
+# Dataset / model paths (resolves env var -> local repo models -> archive fallback)
 # ─────────────────────────────────────────────────────────────
 
 BASE = r"D:\Downloads\archive"
-MODEL_PATH = os.path.join(BASE, "processed", "models_combined", "signspeak_combined_best.keras")
-MEAN_PATH  = os.path.join(BASE, "processed", "models_combined", "feature_mean.npy")
-STD_PATH   = os.path.join(BASE, "processed", "models_combined", "feature_std.npy")
-CLASS_PATH = os.path.join(BASE, "processed", "models_combined", "class_names.json")
-HAND_MODEL_PATH = os.path.join(BASE, "hand_landmarker.task")
+
+def _resolve(env_var: str, rel_subpath: str, archive_subpath: str) -> str:
+    env_p = os.environ.get(env_var, "")
+    if env_p and os.path.exists(env_p):
+        return env_p
+    local_p = os.path.join(AI_SERVICE_ROOT, rel_subpath)
+    if os.path.exists(local_p):
+        return local_p
+    archive_p = os.path.join(BASE, archive_subpath)
+    if os.path.exists(archive_p):
+        return archive_p
+    return local_p
+
+MODEL_PATH = _resolve("MODEL_PATH", "models/signspeak_combined_best.keras", "processed/models_combined/signspeak_combined_best.keras")
+MEAN_PATH  = _resolve("MEAN_PATH", "models/feature_mean.npy", "processed/models_combined/feature_mean.npy")
+STD_PATH   = _resolve("STD_PATH", "models/feature_std.npy", "processed/models_combined/feature_std.npy")
+CLASS_PATH = _resolve("CLASS_PATH", "models/class_names.json", "processed/models_combined/class_names.json")
+HAND_MODEL_PATH = _resolve("HAND_MODEL_PATH", "assets/hand_landmarker.task", "hand_landmarker.task")
 
 # Known "Hello" video for the sanity test (pick first available)
 HELLO_VIDEO_CANDIDATES = [
+    os.path.join(BASE, "Sample Videos", "Hello.mp4"),
+    os.path.join(BASE, "Video_Dataset", "Video_Dataset", "Hello", "WIN_20231103_13_22_45_Pro.mp4"),
     os.path.join(BASE, "Video_Dataset", "Video_Dataset", "Hello", "Hello_1.mp4"),
     os.path.join(BASE, "Video_Dataset", "Video_Dataset", "Hello", "Hello_2.mp4"),
-    os.path.join(BASE, "Sample Videos", "Hello.mp4"),
 ]
 HELLO_VIDEO = next((p for p in HELLO_VIDEO_CANDIDATES if os.path.exists(p)), None)
 
@@ -98,19 +112,19 @@ def loaded_predictor():
     from app.config import get_settings
     get_settings.cache_clear()
 
-    from app.models.predictor import SignPredictor
-    p = SignPredictor()
-    p.load()
-    return p
+    from app.models.predictor import predictor
+    if not predictor.is_loaded:
+        predictor.load()
+    return predictor
 
 
 @pytest.fixture(scope="session")
 def loaded_extractor():
     """Load the MediaPipe extractor once for the whole test session."""
-    from app.recognition.landmark_extractor import LandmarkExtractor
-    e = LandmarkExtractor()
-    e.load()
-    return e
+    from app.recognition.landmark_extractor import extractor
+    if not extractor.is_loaded:
+        extractor.load()
+    return extractor
 
 
 @pytest.fixture(scope="session")
@@ -119,12 +133,19 @@ def class_names(loaded_predictor):
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. Model loading
+# 1. Model loading & Dimensions
 # ─────────────────────────────────────────────────────────────
 
 @requires_model
 def test_model_loading(loaded_predictor):
     assert loaded_predictor.is_loaded, "Predictor should be loaded"
+
+
+@requires_model
+def test_model_dimensions(loaded_predictor):
+    """Verify input shape (None, 32, 126) and output shape (None, 96)."""
+    assert loaded_predictor._model.input_shape == (None, 32, 126)
+    assert loaded_predictor._model.output_shape == (None, 96)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -151,11 +172,15 @@ def test_class_names_are_strings(loaded_predictor):
 @requires_model
 def test_landmark_extraction_shape_no_hand(loaded_extractor):
     """A blank white image should produce a (126,) all-zeros feature vector."""
-    import numpy as np
     blank = np.ones((480, 640, 3), dtype=np.uint8) * 255
     features, hands_detected = loaded_extractor.extract_from_bgr(blank)
     assert features.shape == (126,), f"Feature shape wrong: {features.shape}"
     assert hands_detected == 0
+
+    # Also verify direct extract() method returns identical features
+    features_direct = loaded_extractor.extract(blank)
+    assert features_direct.shape == (126,)
+    assert np.allclose(features, features_direct)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -291,8 +316,37 @@ async def test_invalid_frame_handling():
             assert "code" in msg
 
 
+@requires_model
+@pytest.mark.asyncio
+async def test_websocket_control_messages():
+    """Test clear_sentence and reset control actions over WebSocket."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/sign") as ws:
+            # Consume the initial status
+            init_msg = ws.receive_json()
+            assert init_msg["type"] == "status"
+            assert init_msg["status"] == "connected"
+
+            # Clear sentence control
+            ws.send_text(json.dumps({"type": "control", "action": "clear_sentence"}))
+            clear_msg = ws.receive_json()
+            assert clear_msg["type"] == "sentence"
+            assert clear_msg["sentence"] == ""
+            assert clear_msg["words"] == []
+
+            # Reset control
+            ws.send_text(json.dumps({"type": "control", "action": "reset"}))
+            reset_msg = ws.receive_json()
+            assert reset_msg["type"] == "status"
+            assert reset_msg["status"] == "reset"
+            assert reset_msg["frames_collected"] == 0
+
+
 # ─────────────────────────────────────────────────────────────
-# 11. Known video sanity test — Hello should be in top predictions
+# 12. Known video sanity test — Hello should be in top predictions
 # ─────────────────────────────────────────────────────────────
 
 @requires_model
@@ -334,11 +388,8 @@ def test_hello_video_prediction(loaded_predictor, loaded_extractor):
     # Extract features
     feature_list = []
     for frame in frames[:sequence_length]:
-        try:
-            feats, _ = loaded_extractor.extract_from_bgr(frame)
-            feature_list.append(feats)
-        except Exception:
-            feature_list.append(np.zeros(126, dtype=np.float32))
+        feats, _ = loaded_extractor.extract_from_bgr(frame)
+        feature_list.append(feats)
 
     sequence = np.array(feature_list[:sequence_length], dtype=np.float32)
     assert sequence.shape == (32, 126), f"Sequence shape wrong: {sequence.shape}"
@@ -409,3 +460,377 @@ def test_validate_feature_vector_nan():
     v = np.zeros(126, dtype=np.float32)
     v[0] = float("nan")
     assert validate_feature_vector(v) is False
+
+
+def test_validate_feature_vector_inf():
+    from app.recognition.preprocessing import validate_feature_vector
+    v = np.zeros(126, dtype=np.float32)
+    v[5] = float("inf")
+    assert validate_feature_vector(v) is False
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 2 & 3 Focused Tests
+# ─────────────────────────────────────────────────────────────
+
+def test_artifact_path_resolution():
+    """Verify that Settings._resolve_path resolves local repo artifacts and environment overrides."""
+    from app.config import Settings
+    from pathlib import Path
+    ai_root = Path(__file__).resolve().parent.parent
+
+    # 1. Existing file resolution
+    rel_model = ai_root / "models" / "signspeak_combined_best.keras"
+    resolved = Settings._resolve_path("", rel_model, "")
+    assert os.path.exists(resolved)
+    assert os.path.samefile(resolved, rel_model)
+
+    # 2. Env override resolution (relative to ai_root)
+    resolved_env = Settings._resolve_path("models/signspeak_combined_best.keras", rel_model, "")
+    assert os.path.exists(resolved_env)
+    assert os.path.samefile(resolved_env, rel_model)
+
+    # 3. Nonexistent fallback returns candidate path
+    nonexistent = Settings._resolve_path("nonexistent_model.keras", ai_root / "models" / "nonexistent.keras", "")
+    assert "nonexistent" in nonexistent
+
+
+def test_missing_model_file_raises_error(monkeypatch):
+    """Verify that SignPredictor.load raises FileNotFoundError if model is missing."""
+    from app.models.predictor import SignPredictor
+    from app.config import get_settings
+
+    p = SignPredictor()
+    monkeypatch.setenv("MODEL_PATH", "nonexistent/path/model.keras")
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(FileNotFoundError, match="MODEL_NOT_FOUND"):
+            p.load()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_missing_asset_file_raises_error(monkeypatch):
+    """Verify that LandmarkExtractor.load raises FileNotFoundError if task file is missing."""
+    from app.recognition.landmark_extractor import LandmarkExtractor
+    from app.config import get_settings
+
+    monkeypatch.setenv("HAND_MODEL_PATH", "nonexistent/path/hand_landmarker.task")
+    get_settings.cache_clear()
+    e = LandmarkExtractor()
+    try:
+        with pytest.raises(FileNotFoundError):
+            e.load()
+    finally:
+        get_settings.cache_clear()
+
+
+def test_landmark_extraction_invalid_frames(loaded_extractor):
+    """Corrupted/invalid frames must raise ValueError, not return all zeros."""
+    # 1. None
+    with pytest.raises(ValueError, match="valid NumPy image"):
+        loaded_extractor.extract_from_bgr(None)
+
+    # 2. Empty array
+    with pytest.raises(ValueError, match="empty"):
+        loaded_extractor.extract_from_bgr(np.zeros((0,), dtype=np.uint8))
+
+    # 3. 2D array instead of 3D BGR
+    with pytest.raises(ValueError, match="three-channel BGR image"):
+        loaded_extractor.extract_from_bgr(np.zeros((100, 100), dtype=np.uint8))
+
+    # 4. Zero dimensions / empty frame
+    with pytest.raises(ValueError, match="Input frame is empty"):
+        loaded_extractor.extract_from_bgr(np.zeros((0, 100, 3), dtype=np.uint8))
+
+
+def test_prediction_pipeline_compatibility(loaded_predictor, loaded_extractor):
+    """
+    Test full frame ingestion through RecognitionSession:
+    - 31 frames return status='collecting'
+    - 32nd frame returns prediction structure with confidence and top predictions
+    """
+    import cv2
+    from app.services.recognition_service import RecognitionSession
+
+    session = RecognitionSession(connection_id="test_sess")
+    blank = np.ones((100, 100, 3), dtype=np.uint8) * 200
+    _, buf = cv2.imencode(".jpg", blank)
+    jpeg_bytes = buf.tobytes()
+
+    # Ingest 31 frames
+    for i in range(31):
+        res = session.process_frame_bytes(jpeg_bytes)
+        assert res["type"] == "status"
+        assert res["status"] == "collecting"
+        assert res["frames_collected"] == i + 1
+
+    # 32nd frame should produce a prediction
+    res32 = session.process_frame_bytes(jpeg_bytes)
+    assert res32["type"] == "prediction"
+    assert "prediction" in res32
+    assert "confidence" in res32
+    assert "top_predictions" in res32
+    assert "hands_detected" in res32
+    assert len(res32["top_predictions"]) == 3
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 4 Focused Tests: Readiness, Health Probes & WebSocket API
+# ─────────────────────────────────────────────────────────────
+
+@requires_model
+def test_health_and_readiness_when_ready(loaded_predictor, loaded_extractor):
+    """Verify /health, /ready, /live, and /classes return 200 and expected payloads when service is ready."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as client:
+        # GET /health
+        h_resp = client.get("/health")
+        assert h_resp.status_code == 200
+        data = h_resp.json()
+        assert data["status"] == "ok"
+        assert data["ready"] is True
+        assert data["predictor_ready"] is True
+        assert data["extractor_ready"] is True
+        assert data["classes"] == 96
+        assert data["model"] == "signspeak_combined_best"
+        assert data["service"] == "signspeak-ai"
+
+        # GET /ready
+        r_resp = client.get("/ready")
+        assert r_resp.status_code == 200
+        r_data = r_resp.json()
+        assert r_data["status"] == "ready"
+        assert r_data["ready"] is True
+        assert r_data["predictor_ready"] is True
+        assert r_data["extractor_ready"] is True
+
+        # GET /live
+        l_resp = client.get("/live")
+        assert l_resp.status_code == 200
+        assert l_resp.json()["status"] == "alive"
+
+        # GET /classes
+        c_resp = client.get("/classes")
+        assert c_resp.status_code == 200
+        classes = c_resp.json()["classes"]
+        assert len(classes) == 96
+        assert classes[0]["id"] == 0
+        assert isinstance(classes[0]["name"], str)
+
+
+def test_health_and_readiness_when_predictor_unavailable(loaded_extractor, monkeypatch):
+    """Verify /health and /ready return 503 when predictor is not loaded."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.models.predictor import predictor
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(predictor, "_loaded", False)
+
+        h_resp = client.get("/health")
+        assert h_resp.status_code == 503
+        data = h_resp.json()
+        assert data["ready"] is False
+        assert data["predictor_ready"] is False
+        assert data["extractor_ready"] is True
+        assert data["classes"] == 0
+
+        r_resp = client.get("/ready")
+        assert r_resp.status_code == 503
+        assert r_resp.json()["ready"] is False
+        assert r_resp.json()["status"] == "not_ready"
+
+        # Live probe still returns 200
+        l_resp = client.get("/live")
+        assert l_resp.status_code == 200
+        assert l_resp.json()["status"] == "alive"
+
+        # Classes returns 503
+        c_resp = client.get("/classes")
+        assert c_resp.status_code == 503
+
+
+def test_health_and_readiness_when_extractor_unavailable(loaded_predictor, monkeypatch):
+    """Verify /health and /ready return 503 when MediaPipe extractor is not loaded."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.recognition.landmark_extractor import extractor
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(extractor, "_loaded", False)
+
+        h_resp = client.get("/health")
+        assert h_resp.status_code == 503
+        data = h_resp.json()
+        assert data["ready"] is False
+        assert data["predictor_ready"] is True
+        assert data["extractor_ready"] is False
+
+        r_resp = client.get("/ready")
+        assert r_resp.status_code == 503
+        assert r_resp.json()["ready"] is False
+
+
+def test_websocket_rejection_when_predictor_unavailable(loaded_extractor, monkeypatch):
+    """Verify /ws/sign rejects connection with code 1013 when predictor is unavailable."""
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+    from app.main import app
+    from app.models.predictor import predictor
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(predictor, "_loaded", False)
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect("/ws/sign"):
+                pass
+        assert exc_info.value.code == 1013
+
+
+def test_websocket_rejection_when_extractor_unavailable(loaded_predictor, monkeypatch):
+    """Verify /ws/sign rejects connection with code 1013 when extractor is unavailable."""
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+    from app.main import app
+    from app.recognition.landmark_extractor import extractor
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(extractor, "_loaded", False)
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect("/ws/sign"):
+                pass
+        assert exc_info.value.code == 1013
+
+
+@requires_model
+def test_websocket_binary_and_base64_frame_input(loaded_predictor, loaded_extractor):
+    """Verify binary JPEG/PNG frames and JSON Base64 frames (with and without prefix) are processed."""
+    import cv2
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    blank = np.ones((100, 100, 3), dtype=np.uint8) * 128
+    _, buf = cv2.imencode(".jpg", blank)
+    jpeg_bytes = buf.tobytes()
+    b64_raw = base64.b64encode(jpeg_bytes).decode("ascii")
+    b64_with_prefix = f"data:image/jpeg;base64,{b64_raw}"
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/sign") as ws:
+            init_msg = ws.receive_json()
+            assert init_msg["type"] == "status"
+            assert init_msg["status"] == "connected"
+
+            # 1. Binary JPEG frame
+            ws.send_bytes(jpeg_bytes)
+            bin_res = ws.receive_json()
+            assert bin_res["type"] == "status"
+            assert bin_res["status"] == "collecting"
+            assert bin_res["frames_collected"] == 1
+
+            # 2. Base64 frame
+            ws.send_text(json.dumps({"type": "frame", "data": b64_raw}))
+            b64_res = ws.receive_json()
+            assert b64_res["type"] == "status"
+            assert b64_res["status"] == "collecting"
+            assert b64_res["frames_collected"] == 2
+
+            # 3. Base64 frame with data URI prefix
+            ws.send_text(json.dumps({"type": "frame", "data": b64_with_prefix}))
+            prefix_res = ws.receive_json()
+            assert prefix_res["type"] == "status"
+            assert prefix_res["status"] == "collecting"
+            assert prefix_res["frames_collected"] == 3
+
+
+@requires_model
+def test_websocket_invalid_frames_and_disconnect_cleanup(loaded_predictor, loaded_extractor):
+    """Verify invalid frames and messages return structured error without crashing or killing session."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/sign") as ws:
+            _ = ws.receive_json()  # Consume initial connected status
+
+            # 1. Garbage binary bytes
+            ws.send_bytes(b"not an image at all")
+            err1 = ws.receive_json()
+            assert err1["type"] == "error"
+            assert err1["code"] == "INVALID_FRAME"
+
+            # 2. Non-dict JSON text
+            ws.send_text(json.dumps(["not", "an", "object"]))
+            err2 = ws.receive_json()
+            assert err2["type"] == "error"
+            assert err2["code"] == "INVALID_FRAME"
+
+            # 3. Missing frame data
+            ws.send_text(json.dumps({"type": "frame", "data": ""}))
+            err3 = ws.receive_json()
+            assert err3["type"] == "error"
+            assert err3["code"] == "INVALID_FRAME"
+
+            # 4. Unknown control action
+            ws.send_text(json.dumps({"type": "control", "action": "unknown_action"}))
+            err4 = ws.receive_json()
+            assert err4["type"] == "error"
+            assert err4["code"] == "INVALID_FRAME"
+
+            # 5. Unknown message type
+            ws.send_text(json.dumps({"type": "unknown_type"}))
+            err5 = ws.receive_json()
+            assert err5["type"] == "error"
+            assert err5["code"] == "INVALID_FRAME"
+
+            # 6. Session still alive and accepts reset
+            ws.send_text(json.dumps({"type": "control", "action": "reset"}))
+            reset_res = ws.receive_json()
+            assert reset_res["type"] == "status"
+            assert reset_res["status"] == "reset"
+            assert reset_res["frames_collected"] == 0
+
+
+@requires_model
+def test_websocket_full_32_frame_prediction_pipeline(loaded_predictor, loaded_extractor):
+    """Verify feeding 32 frames over WebSocket triggers prediction matching Flutter client contract."""
+    import cv2
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    blank = np.ones((100, 100, 3), dtype=np.uint8) * 128
+    _, buf = cv2.imencode(".jpg", blank)
+    jpeg_bytes = buf.tobytes()
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/sign") as ws:
+            _ = ws.receive_json()  # Initial connected status
+
+            # Send 31 frames -> all collecting
+            for i in range(1, 32):
+                ws.send_bytes(jpeg_bytes)
+                msg = ws.receive_json()
+                assert msg["type"] == "status"
+                assert msg["status"] == "collecting"
+                assert msg["frames_collected"] == i
+
+            # 32nd frame -> triggers prediction
+            ws.send_bytes(jpeg_bytes)
+            pred = ws.receive_json()
+            assert pred["type"] == "prediction"
+            assert "prediction" in pred
+            assert "confidence" in pred
+            assert "recognized" in pred
+            assert "top_predictions" in pred
+            assert isinstance(pred["top_predictions"], list)
+            assert len(pred["top_predictions"]) == 3
+            assert "hands_detected" in pred
+            assert pred["frames_collected"] == 32
+            assert "timestamp" in pred
+            assert "sentence" in pred
+            assert "sentence_words" in pred
+            assert "sentence_updated" in pred
+
+

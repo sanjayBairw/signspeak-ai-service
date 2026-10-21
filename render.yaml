@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: signspeak-ai-service
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    region: oregon
+    plan: starter
+    healthCheckPath: /ready
+    autoDeploy: false
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: MODEL_PATH
+        value: models/signspeak_combined_best.keras
+      - key: MEAN_PATH
+        value: models/feature_mean.npy
+      - key: STD_PATH
+        value: models/feature_std.npy
+      - key: CLASS_PATH
+        value: models/class_names.json
+      - key: HAND_MODEL_PATH
+        value: assets/hand_landmarker.task
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: LOG_LEVEL
+        value: INFO

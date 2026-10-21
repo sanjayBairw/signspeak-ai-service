@@ -145,6 +145,11 @@ class SignPredictor:
                 f"Expected (None, {settings.sequence_length}, {settings.features_per_frame}), "
                 f"got {self._model.input_shape}"
             )
+        if self._model.output_shape != (None, 96):
+            raise RuntimeError(
+                f"[INVALID_MODEL] Model output shape mismatch. "
+                f"Expected (None, 96), got {self._model.output_shape}"
+            )
 
         # ── Normalization ─────────────────────────────────────────
         logger.info("Loading normalization stats…")

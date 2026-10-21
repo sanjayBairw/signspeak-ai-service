@@ -52,9 +52,10 @@ import logging
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from app.models.predictor import predictor
+from app.recognition.landmark_extractor import extractor
 from app.services.recognition_service import RecognitionSession
 
 logger = logging.getLogger(__name__)
@@ -66,23 +67,27 @@ router = APIRouter(tags=["recognition"])
 async def websocket_sign(websocket: WebSocket) -> None:
     """Real-time sign recognition WebSocket endpoint."""
 
+    # ── Check dependency readiness BEFORE accepting session ────
+    if not predictor.is_loaded or not extractor.is_loaded:
+        logger.warning(
+            "Rejecting /ws/sign connection: AI service dependencies not ready "
+            "(predictor_ready=%s, extractor_ready=%s)",
+            predictor.is_loaded,
+            extractor.is_loaded,
+        )
+        await websocket.close(
+            code=status.WS_1013_TRY_AGAIN_LATER,
+            reason="AI service dependencies not ready",
+        )
+        return
+
     await websocket.accept()
     connection_id = str(uuid.uuid4())[:8]
     session: Optional[RecognitionSession] = None
 
-    logger.info("[%s] WebSocket connected.", connection_id)
+    logger.info("[%s] WebSocket connected and session initialized.", connection_id)
 
     try:
-        # ── Wait until model is ready ──────────────────────────────
-        if not predictor.is_loaded:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "code": "MODEL_NOT_FOUND",
-                "message": "AI model is still loading. Please retry in a moment.",
-            }))
-            await websocket.close()
-            return
-
         # ── Create per-connection session ──────────────────────────
         session = RecognitionSession(connection_id)
 
@@ -140,12 +145,20 @@ async def websocket_sign(websocket: WebSocket) -> None:
                     }))
                     continue
 
+                if not isinstance(payload, dict):
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "code": "INVALID_FRAME",
+                        "message": "JSON text payload must be an object.",
+                    }))
+                    continue
+
                 msg_type = payload.get("type", "")
 
                 if msg_type == "frame":
                     # Base64-encoded frame sent as JSON text
                     b64_data = payload.get("data", "")
-                    if not b64_data:
+                    if not b64_data or not isinstance(b64_data, str):
                         await websocket.send_text(json.dumps({
                             "type": "error",
                             "code": "INVALID_FRAME",
@@ -206,8 +219,10 @@ async def websocket_sign(websocket: WebSocket) -> None:
                     }))
 
     except WebSocketDisconnect:
-        pass
+        logger.info("[%s] WebSocket client disconnected cleanly.", connection_id)
     except Exception:
         logger.exception("[%s] Unhandled WebSocket error.", connection_id)
     finally:
-        logger.info("[%s] WebSocket disconnected.", connection_id)
+        if session is not None:
+            session.reset()
+        logger.info("[%s] WebSocket disconnected and session cleaned up.", connection_id)

@@ -141,9 +141,8 @@ class RecognitionSession:
 
         # 3. Validate feature vector
         if not validate_feature_vector(features):
-            logger.debug("[%s] Invalid feature vector — skipping frame.", self.connection_id)
-            features = np.zeros(settings.features_per_frame, dtype=np.float32)
-            hands_detected = 0
+            logger.error("[%s] Invalid feature vector generated — reporting error.", self.connection_id)
+            raise ValueError("[INVALID_FRAME] Invalid landmark feature vector (non-finite or incorrect shape).")
 
         # 4. Add to sequence buffer
         self.sequence_buffer.add_frame(features, hands_detected)

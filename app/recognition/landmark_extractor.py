@@ -38,6 +38,7 @@ class LandmarkExtractor:
 
     def load(self) -> None:
         """Initialize MediaPipe HandLandmarker using the CPU delegate."""
+        self.settings = get_settings()
         if self.is_loaded:
             logger.info("MediaPipe HandLandmarker already initialized.")
             return
@@ -105,14 +106,16 @@ class LandmarkExtractor:
                 self._loaded = False
                 logger.info("MediaPipe HandLandmarker closed.")
 
-    def extract(self, frame: np.ndarray) -> np.ndarray:
+    def extract_from_bgr(self, frame: np.ndarray) -> tuple[np.ndarray, int]:
         """
-        Extract 126 features from a BGR image frame.
+        Extract 126 features and detected hand count from a BGR image frame.
 
         Returns:
-            float32 array of shape (126,).
-            Each hand contributes 21 landmarks x (x, y, z).
-            Missing hands are represented by zeros.
+            Tuple of (features, hands_detected):
+                - features: float32 array of shape (126,).
+                  Each hand contributes 21 landmarks x (x, y, z).
+                  Missing hands are represented by zeros.
+                - hands_detected: int count of detected hands (0, 1, or 2).
         """
         if not self.is_loaded:
             raise RuntimeError(
@@ -162,7 +165,7 @@ class LandmarkExtractor:
         features = np.zeros((2, 21, 3), dtype=np.float32)
 
         if not result.hand_landmarks:
-            return features.reshape(-1)
+            return features.reshape(-1), 0
 
         detected_hands = []
 
@@ -195,7 +198,20 @@ class LandmarkExtractor:
         for index, (_, hand) in enumerate(detected_hands[:2]):
             features[index] = hand
 
-        return features.reshape(-1)
+        num_hands = min(len(detected_hands), 2)
+        return features.reshape(-1), num_hands
+
+    def extract(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Extract 126 features from a BGR image frame.
+
+        Returns:
+            float32 array of shape (126,).
+            Each hand contributes 21 landmarks x (x, y, z).
+            Missing hands are represented by zeros.
+        """
+        features, _ = self.extract_from_bgr(frame)
+        return features
 
     def extract_sequence(self, frames: list) -> np.ndarray:
         """

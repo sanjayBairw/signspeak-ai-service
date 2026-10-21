@@ -16,4 +16,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8000
+
+EXPOSE 8000
+
+# Use exec to forward SIGTERM directly to Uvicorn and configure WebSocket keepalive pings for Render reverse proxy
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --ws-ping-interval 20 --ws-ping-timeout 30"]
