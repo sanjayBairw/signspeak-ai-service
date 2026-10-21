@@ -47,12 +47,14 @@ One RecognitionSession is created per connection and destroyed on disconnect.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+from starlette.websockets import WebSocketState
 
 from app.models.predictor import predictor
 from app.recognition.landmark_extractor import extractor
@@ -61,6 +63,24 @@ from app.services.recognition_service import RecognitionSession
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["recognition"])
+
+
+async def _safe_send_json(websocket: WebSocket, data: dict) -> bool:
+    """
+    Safely send a JSON message over the WebSocket.
+    Returns True if sent successfully, False if connection is closed or closing.
+    Never throws RuntimeError or WebSocketDisconnect to caller.
+    """
+    if websocket.client_state != WebSocketState.CONNECTED:
+        return False
+    try:
+        await websocket.send_text(json.dumps(data))
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
+    except Exception as exc:
+        logger.debug("Failed to send WebSocket message: %s", exc)
+        return False
 
 
 @router.websocket("/ws/sign")
@@ -92,18 +112,19 @@ async def websocket_sign(websocket: WebSocket) -> None:
         session = RecognitionSession(connection_id)
 
         # ── Send initial status ────────────────────────────────────
-        await websocket.send_text(json.dumps({
+        if not await _safe_send_json(websocket, {
             "type": "status",
             "status": "connected",
             "frames_collected": 0,
             "required_frames": 32,
-        }))
+        }):
+            return
 
         # ── Message loop ───────────────────────────────────────────
         while True:
             try:
                 message = await websocket.receive()
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, RuntimeError):
                 break
 
             if "bytes" in message and message["bytes"]:
@@ -111,46 +132,57 @@ async def websocket_sign(websocket: WebSocket) -> None:
                 frame_bytes: bytes = message["bytes"]
 
                 try:
-                    result = session.process_frame_bytes(frame_bytes)
-                    await websocket.send_text(json.dumps(result))
+                    # Offload CPU-intensive decoding, MediaPipe extraction, and Keras
+                    # prediction to a worker thread so the main asyncio event loop remains
+                    # unblocked to immediately handle WebSocket keepalive pings/pongs.
+                    result = await asyncio.to_thread(session.process_frame_bytes, frame_bytes)
+                    if not await _safe_send_json(websocket, result):
+                        break
                 except ValueError as ve:
-                    await websocket.send_text(json.dumps({
+                    if not await _safe_send_json(websocket, {
                         "type": "error",
                         "code": "INVALID_FRAME",
                         "message": str(ve),
-                    }))
+                    }):
+                        break
                 except RuntimeError as re:
-                    await websocket.send_text(json.dumps({
+                    if not await _safe_send_json(websocket, {
                         "type": "error",
                         "code": "MEDIAPIPE_ERROR",
                         "message": str(re),
-                    }))
+                    }):
+                        break
+                except (WebSocketDisconnect, ConnectionError):
+                    break
                 except Exception as exc:
-                    logger.exception("[%s] Unexpected frame processing error.", connection_id)
-                    await websocket.send_text(json.dumps({
+                    logger.exception("[%s] Unexpected frame processing error: %s", connection_id, exc)
+                    if not await _safe_send_json(websocket, {
                         "type": "error",
                         "code": "MODEL_INFERENCE_ERROR",
                         "message": "Internal server error during inference.",
-                    }))
+                    }):
+                        break
 
             elif "text" in message and message["text"]:
                 # ── Text / control message ─────────────────────────
                 try:
                     payload = json.loads(message["text"])
                 except json.JSONDecodeError:
-                    await websocket.send_text(json.dumps({
+                    if not await _safe_send_json(websocket, {
                         "type": "error",
                         "code": "INVALID_FRAME",
                         "message": "Invalid JSON in text message.",
-                    }))
+                    }):
+                        break
                     continue
 
                 if not isinstance(payload, dict):
-                    await websocket.send_text(json.dumps({
+                    if not await _safe_send_json(websocket, {
                         "type": "error",
                         "code": "INVALID_FRAME",
                         "message": "JSON text payload must be an object.",
-                    }))
+                    }):
+                        break
                     continue
 
                 msg_type = payload.get("type", "")
@@ -159,66 +191,77 @@ async def websocket_sign(websocket: WebSocket) -> None:
                     # Base64-encoded frame sent as JSON text
                     b64_data = payload.get("data", "")
                     if not b64_data or not isinstance(b64_data, str):
-                        await websocket.send_text(json.dumps({
+                        if not await _safe_send_json(websocket, {
                             "type": "error",
                             "code": "INVALID_FRAME",
                             "message": "No frame data in JSON message.",
-                        }))
+                        }):
+                            break
                         continue
                     try:
-                        result = session.process_frame_b64(b64_data)
-                        await websocket.send_text(json.dumps(result))
+                        result = await asyncio.to_thread(session.process_frame_b64, b64_data)
+                        if not await _safe_send_json(websocket, result):
+                            break
                     except ValueError as ve:
-                        await websocket.send_text(json.dumps({
+                        if not await _safe_send_json(websocket, {
                             "type": "error",
                             "code": "INVALID_FRAME",
                             "message": str(ve),
-                        }))
+                        }):
+                            break
                     except RuntimeError as re:
-                        await websocket.send_text(json.dumps({
+                        if not await _safe_send_json(websocket, {
                             "type": "error",
                             "code": "MEDIAPIPE_ERROR",
                             "message": str(re),
-                        }))
-                    except Exception:
-                        logger.exception("[%s] Base64 frame error.", connection_id)
-                        await websocket.send_text(json.dumps({
+                        }):
+                            break
+                    except (WebSocketDisconnect, ConnectionError):
+                        break
+                    except Exception as exc:
+                        logger.exception("[%s] Base64 frame error: %s", connection_id, exc)
+                        if not await _safe_send_json(websocket, {
                             "type": "error",
                             "code": "MODEL_INFERENCE_ERROR",
                             "message": "Internal server error during inference.",
-                        }))
+                        }):
+                            break
 
                 elif msg_type == "control":
                     action = payload.get("action", "")
                     if action == "clear_sentence":
                         session.clear_sentence()
-                        await websocket.send_text(json.dumps({
+                        if not await _safe_send_json(websocket, {
                             "type": "sentence",
                             "words": [],
                             "sentence": "",
-                        }))
+                        }):
+                            break
                     elif action == "reset":
                         session.reset()
-                        await websocket.send_text(json.dumps({
+                        if not await _safe_send_json(websocket, {
                             "type": "status",
                             "status": "reset",
                             "frames_collected": 0,
                             "required_frames": 32,
-                        }))
+                        }):
+                            break
                     else:
-                        await websocket.send_text(json.dumps({
+                        if not await _safe_send_json(websocket, {
                             "type": "error",
                             "code": "INVALID_FRAME",
                             "message": f"Unknown control action: {action}",
-                        }))
+                        }):
+                            break
                 else:
-                    await websocket.send_text(json.dumps({
+                    if not await _safe_send_json(websocket, {
                         "type": "error",
                         "code": "INVALID_FRAME",
                         "message": f"Unknown message type: {msg_type}",
-                    }))
+                    }):
+                        break
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         logger.info("[%s] WebSocket client disconnected cleanly.", connection_id)
     except Exception:
         logger.exception("[%s] Unhandled WebSocket error.", connection_id)
